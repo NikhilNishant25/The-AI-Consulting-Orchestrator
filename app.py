@@ -1,6 +1,22 @@
+import re
+
 import streamlit as st
 from openai import OpenAI
 from tavily import TavilyClient
+
+# Gemini is called through Google's OpenAI-compatible endpoint, so the `openai`
+# library is reused and only the base URL and key change.
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# Used only if the live model list cannot be fetched.
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+# Model names containing any of these are not text-generation chat models.
+EXCLUDED_TOKENS = (
+    "image", "tts", "embedding", "embed", "live", "audio", "aqa", "imagen",
+    "veo", "robotics", "computer-use", "learnlm", "vision", "exp", "dialog",
+)
+MAX_ATTEMPTS = 8  # how many candidate models to try before giving up
 
 SYSTEM_PROMPT = (
     "You are an elite MBB strategy consultant. Take the provided raw market research "
@@ -49,32 +65,109 @@ def run_research(tavily_key: str, client_name: str, industry: str, objective: st
     return "\n\n".join(blocks)
 
 
-def run_structuring(openai_key: str, client_name: str, industry: str, objective: str, research: str) -> str:
-    """Agent 2: turn raw research into a GTM strategy with gpt-4o-mini."""
-    client = OpenAI(api_key=openai_key)
+def rank_models(model_ids):
+    """Order Gemini text models best-first: newest version, then Pro > Flash > Flash-Lite,
+    then stable before preview. Models without a version (e.g. *-latest aliases) go last."""
+    tiers = {"pro": 0, "flash": 1, "flash-lite": 2}
+    scored = []
+    for raw in model_ids:
+        name = raw.split("/")[-1].lower()
+        if not name.startswith("gemini"):
+            continue
+        if any(token in name for token in EXCLUDED_TOKENS):
+            continue
+        match = re.match(r"^gemini-(\d+(?:\.\d+)?)-(pro|flash-lite|flash)", name)
+        if match:
+            version, tier = float(match.group(1)), tiers[match.group(2)]
+        else:
+            version = 0.0
+            tier = 0 if "pro" in name else (2 if "lite" in name else 1)
+        is_preview = 1 if "preview" in name else 0
+        scored.append(((-version, tier, is_preview, name), raw.split("/")[-1]))
+    scored.sort(key=lambda item: item[0])
+
+    ordered, seen = [], set()
+    for _, name in scored:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def get_candidate_models(client: OpenAI):
+    """Ask Gemini which models this key can see, ranked best-first."""
+    try:
+        ids = [m.id for m in client.models.list()]
+        ranked = rank_models(ids)
+        if ranked:
+            return ranked
+    except Exception:
+        pass
+    return FALLBACK_MODELS
+
+
+def is_bad_key_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        getattr(exc, "status_code", None) == 401
+        or "api key not valid" in text
+        or "api_key_invalid" in text
+    )
+
+
+def run_structuring(gemini_key: str, client_name: str, industry: str, objective: str, research: str):
+    """Agent 2: turn raw research into a GTM strategy using the best Gemini model
+    that works for this key (free tier or paid). Returns (text, model_used)."""
+    client = OpenAI(api_key=gemini_key, base_url=GEMINI_BASE_URL)
     user_message = (
         f"Client Name: {client_name}\n"
         f"Industry: {industry}\n"
         f"Strategic Objective: {objective}\n\n"
         f"Raw Market Research:\n{research}"
     )
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.3,
+
+    candidates = get_candidate_models(client)
+
+    # Try the model that worked last time first, so repeat runs are fast.
+    last_good = st.session_state.get("model_used")
+    if last_good and last_good in candidates:
+        candidates = [last_good] + [m for m in candidates if m != last_good]
+
+    errors = []
+    for model in candidates[:MAX_ATTEMPTS]:
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.3,
+            )
+            text = completion.choices[0].message.content or ""
+            if text.strip():
+                return text, model
+            errors.append(f"{model}: empty response")
+        except Exception as exc:
+            if is_bad_key_error(exc):
+                raise RuntimeError("Your Gemini API key looks invalid. Please check it.") from exc
+            errors.append(f"{model}: {str(exc)[:160]}")
+
+    raise RuntimeError(
+        "No Gemini model worked for this key. Models tried:\n- " + "\n- ".join(errors)
     )
-    return completion.choices[0].message.content or ""
 
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("🔐 API Keys")
-    openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    gemini_key = st.text_input("Gemini API Key", type="password", placeholder="AIza...")
     tavily_key = st.text_input("Tavily API Key", type="password", placeholder="tvly-...")
-    st.caption("Keys stay in your browser session and are never stored or logged.")
+    st.caption(
+        "Keys stay in your browser session and are never stored or logged. "
+        "Get a free Gemini key at aistudio.google.com. "
+        "The app automatically picks the best Gemini model available to your key."
+    )
 
 # ---------- Main ----------
 st.title("🧭 The AI Consulting Orchestrator")
@@ -95,8 +188,8 @@ with col2:
     )
 
 if st.button("Generate Strategy", type="primary"):
-    if not openai_key or not tavily_key:
-        st.error("Please enter both your OpenAI and Tavily API keys in the sidebar.")
+    if not gemini_key or not tavily_key:
+        st.error("Please enter both your Gemini and Tavily API keys in the sidebar.")
     elif not (client_name.strip() and industry.strip() and objective.strip()):
         st.error("Please fill in Client Name, Industry and Strategic Objective.")
     else:
@@ -106,12 +199,17 @@ if st.button("Generate Strategy", type="primary"):
                     tavily_key, client_name.strip(), industry.strip(), objective.strip()
                 )
                 status.update(label="Agent 2: Structuring...")
-                strategy = run_structuring(
-                    openai_key, client_name.strip(), industry.strip(), objective.strip(), research
+                strategy, model_used = run_structuring(
+                    gemini_key,
+                    client_name.strip(),
+                    industry.strip(),
+                    objective.strip(),
+                    research,
                 )
                 status.update(label="Strategy complete", state="complete", expanded=False)
 
             st.session_state["strategy"] = strategy
+            st.session_state["model_used"] = model_used
             st.session_state["client_name"] = client_name.strip()
         except Exception as exc:
             st.session_state.pop("strategy", None)
@@ -119,6 +217,7 @@ if st.button("Generate Strategy", type="primary"):
 
 if st.session_state.get("strategy"):
     st.divider()
+    st.caption(f"Generated with Gemini model: {st.session_state.get('model_used', 'unknown')}")
     st.markdown(st.session_state["strategy"])
 
     file_stub = st.session_state.get("client_name", "client").lower().replace(" ", "_") or "client"
