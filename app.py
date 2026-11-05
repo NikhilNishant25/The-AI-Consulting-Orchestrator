@@ -185,6 +185,12 @@ st.write(
     "another structures it into a MECE Go-To-Market strategy."
 )
 
+st.info(
+    "🎥 **Want a quick walkthrough?** "
+    "[Watch the 90-Second Demo Video](https://www.loom.com/share/501a9de485794d8686dc4b97a70a1a1e) "
+    "to see how this tool automates live strategy research for real clients."
+)
+
 if missing:
     st.error(
         "App is not configured: missing secret(s) " + ", ".join(f"`{m}`" for m in missing) + "."
